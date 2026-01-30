@@ -3,10 +3,12 @@ import { StripeGatewayProvider } from "./StripeGatewayProvider.js";
 import { PayPalGatewayProvider } from "./PayPalGatewayProvider.js";
 import { SquareGatewayProvider } from "./SquareGatewayProvider.js";
 import { EPayMintsGatewayProvider } from "./EPayMintsGatewayProvider.js";
+import { KingdomFundingGatewayProvider } from "./KingdomFundingGatewayProvider.js";
 
 export interface GatewayFeatureFlags {
   enableSquare?: boolean;
   enableEPayMints?: boolean;
+  enableKingdomFunding?: boolean;
   enableCustomProviders?: boolean;
 }
 
@@ -19,6 +21,7 @@ export class GatewayFactory {
     // Always register production-ready providers
     this.providers.set("stripe", new StripeGatewayProvider());
     this.providers.set("paypal", new PayPalGatewayProvider());
+    this.providers.set("kingdomfunding", new KingdomFundingGatewayProvider());
 
     // Load feature flags from environment or config
     this.loadFeatureFlags();
@@ -32,6 +35,7 @@ export class GatewayFactory {
     this.featureFlags = {
       enableSquare: process.env.ENABLE_SQUARE === "true",
       enableEPayMints: process.env.ENABLE_EPAYMINTS === "true",
+      enableKingdomFunding: process.env.ENABLE_KINGDOMFUNDING === "true",
       enableCustomProviders: process.env.ENABLE_CUSTOM_GATEWAY_PROVIDERS === "true"
     };
   }
@@ -82,6 +86,7 @@ export class GatewayFactory {
   private static syncFeatureFlagProviders(): void {
     this.toggleProvider("square", this.featureFlags.enableSquare, () => new SquareGatewayProvider());
     this.toggleProvider("epaymints", this.featureFlags.enableEPayMints, () => new EPayMintsGatewayProvider());
+    this.toggleProvider("kingdomfunding", this.featureFlags.enableKingdomFunding, () => new KingdomFundingGatewayProvider());
   }
 
   private static toggleProvider(

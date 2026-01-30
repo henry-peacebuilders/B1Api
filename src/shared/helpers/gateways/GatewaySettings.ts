@@ -59,12 +59,18 @@ export namespace ePayMintsSettings {
   }
 }
 
+// KingdomFunding-specific settings (placeholder)
+export namespace KingdomFundingSettings {
+  export interface Settings extends BaseGatewaySettings {}
+}
+
 // Union type for all gateway settings
 export type GatewaySettings =
   | { provider: "stripe"; settings: StripeSettings.Settings }
   | { provider: "paypal"; settings: PayPalSettings.Settings }
   | { provider: "square"; settings: SquareSettings.Settings }
-  | { provider: "epaymints"; settings: ePayMintsSettings.Settings };
+  | { provider: "epaymints"; settings: ePayMintsSettings.Settings }
+  | { provider: "kingdomfunding"; settings: KingdomFundingSettings.Settings };
 
 // Type guard functions
 export function isStripeSettings(settings: any): settings is StripeSettings.Settings {
@@ -83,6 +89,10 @@ export function isEPayMintsSettings(settings: any): settings is ePayMintsSetting
   return settings && typeof settings === "object";
 }
 
+export function isKingdomFundingSettings(settings: any): settings is KingdomFundingSettings.Settings {
+  return settings && typeof settings === "object";
+}
+
 // Helper to validate and cast settings based on provider
 export function validateGatewaySettings(provider: string, settings: Record<string, unknown> | null): BaseGatewaySettings | null {
   if (!settings) return null;
@@ -96,6 +106,8 @@ export function validateGatewaySettings(provider: string, settings: Record<strin
       return isSquareSettings(settings) ? settings : null;
     case "epaymints":
       return isEPayMintsSettings(settings) ? settings : null;
+    case "kingdomfunding":
+      return isKingdomFundingSettings(settings) ? settings : null;
     default:
       return null;
   }

@@ -484,6 +484,24 @@ export class GatewayService {
         minTransactionAmount: 100, // $1.00
         maxTransactionAmount: 10000000, // $100,000.00
         notes: ["Webhooks limited; polling recommended", "ACH available via tokenised transactions"]
+      },
+      kingdomfunding: {
+        supportsOneTimePayments: true,
+        supportsSubscriptions: false,
+        supportsVault: false,
+        supportsACH: false,
+        supportsRefunds: false,
+        supportsPartialRefunds: false,
+        supportsWebhooks: false,
+        supportsOrders: false,
+        supportedPaymentMethods: ["card"],
+        supportedCurrencies: ["usd"],
+        requiresPlansForSubscriptions: false,
+        requiresCustomerForSubscription: false,
+        supportsInstantCapture: false,
+        supportsManualCapture: false,
+        supportsSCA: false,
+        notes: ["Placeholder provider; implement SDK integrations before production use"]
       }
     };
 
