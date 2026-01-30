@@ -46,11 +46,19 @@ export class GatewayService {
       }
     };
 
+    const decryptedSecret = decryptIfPresent(gateway.privateKey);
+    const merchantId = decryptedSecret || undefined;
+
+    const provider = gateway.provider?.toLowerCase();
+    const isKingdomFunding = provider === "kingdomfunding";
+    const kingdomFundingPrivateKey = isKingdomFunding ? process.env.KINGDOMFUNDING_PRIVATE_KEY || "" : undefined;
+
     return {
       gatewayId: gateway.id,
       churchId: gateway.churchId,
       publicKey: gateway.publicKey,
-      privateKey: decryptIfPresent(gateway.privateKey),
+      privateKey: isKingdomFunding ? kingdomFundingPrivateKey ?? "" : decryptedSecret,
+      merchantId,
       webhookKey: decryptIfPresent(gateway.webhookKey),
       productId: gateway.productId,
       settings: gateway.settings ?? null,

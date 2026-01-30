@@ -5,6 +5,9 @@ import { RepoManager } from "../../../shared/infrastructure/index.js";
 
 export class GeoHelper {
   static async updateChurchAddress(church: Church) {
+    // Respect runtime flag to avoid hitting external geocoding in local/dev or when blocked
+    if (process.env.ENABLE_GEOCODING !== "true") return;
+
     const options: NodeGeocoder.Options = { provider: "openstreetmap" };
     const geocoder = NodeGeocoder(options);
     const resp: NodeGeocoder.Entry[] = await geocoder.geocode(church.address1 + " " + church.address2 + " " + church.city + ", " + church.state + " " + church.zip + " " + church.country);

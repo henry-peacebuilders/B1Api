@@ -25,6 +25,7 @@ export interface GatewayConfig {
   churchId: string;
   publicKey: string;
   privateKey: string;
+  merchantId?: string; // For providers that separate merchant identifier from secret (e.g., KingdomFunding)
   webhookKey: string;
   productId?: string;
   settings?: Record<string, unknown> | null;
