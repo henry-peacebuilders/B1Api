@@ -219,6 +219,19 @@ export class PaymentMethodController extends GivingCrudController {
             });
           }
         }
+      } else if (gateway.provider?.toLowerCase() === "kingdomfunding" && Array.isArray(rawPaymentMethods)) {
+        for (const method of rawPaymentMethods) {
+          const methodType = method.type || "card";
+          normalizedMethods.push({
+            id: method.id,
+            type: methodType,
+            provider: "kingdomfunding",
+            name: method.brand || method.name || (methodType === "bank" ? "Bank Account" : "Card"),
+            last4: method.last4,
+            customerId: customer.id,
+            status: method.status || "active"
+          });
+        }
       }
 
       return normalizedMethods;

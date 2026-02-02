@@ -57,4 +57,9 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
     // Nothing to create; allow configuration to proceed.
     return undefined;
   }
+
+  async getCustomerPaymentMethods(_config: GatewayConfig, _customer: any): Promise<any> {
+    // Return empty array for now - payment methods not yet implemented
+    return [];
+  }
 }

@@ -496,7 +496,7 @@ export class GatewayService {
       kingdomfunding: {
         supportsOneTimePayments: true,
         supportsSubscriptions: false,
-        supportsVault: false,
+        supportsVault: true,
         supportsACH: false,
         supportsRefunds: false,
         supportsPartialRefunds: false,
