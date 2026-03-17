@@ -112,112 +112,88 @@ export class PaymentMethodController extends GivingCrudController {
   @httpGet("/personid/:id")
   public async getPersonPaymentMethods(@requestParam("id") id: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
-      // Default to Stripe for payment method operations (vault requires Stripe or PayPal)
-      const gateway = await GatewayService.getGatewayForChurch(au.churchId, { provider: "stripe" }, this.repos.gateway).catch(() => null);
-      const permission = gateway && (au.checkAccess(Permissions.donations.view) || id === au.personId);
-      if (!permission) return this.json({}, 401);
+      if (!au.checkAccess(Permissions.donations.view) && id !== au.personId) return this.json({}, 401);
 
-      // Check if provider supports vault/stored payment methods
-      const capabilities = GatewayService.getProviderCapabilities(gateway);
-      if (!capabilities?.supportsVault) {
-        return []; // Return empty array for providers without vault support
-      }
+      // Load ALL gateways for this church
+      const allGateways = (await this.repos.gateway.loadAll(au.churchId)) as any[];
+      if (!allGateways?.length) return [];
 
-      let customer = await this.repos.customer.loadByPersonAndProvider(au.churchId, id, gateway.provider);
-      if (!customer) {
-        customer = await this.repos.customer.loadByPersonId(au.churchId, id);
-      }
-
-      console.log("Customer lookup result:", customer);
-
-      if (!customer) return [];
-      const rawPaymentMethods = await GatewayService.getCustomerPaymentMethods(gateway, customer);
-
-      // Debug logging
-      //console.log("Raw payment methods from gateway:", JSON.stringify(rawPaymentMethods, null, 2));
-
-      // Normalize payment methods to consistent format
       const normalizedMethods: any[] = [];
 
-      if (gateway.provider?.toLowerCase() === "stripe" && Array.isArray(rawPaymentMethods)) {
-        for (const customerData of rawPaymentMethods) {
-          // Handle Stripe payment methods (cards)
-          if (customerData.cards?.data) {
-            for (const pm of customerData.cards.data) {
-              // Stripe PaymentMethod object structure
-              normalizedMethods.push({
-                id: pm.id,
-                type: "card",
-                provider: "stripe",
-                name: pm.card?.brand || "Card",
-                last4: pm.card?.last4,
-                customerId: pm.customer || customerData.customer?.id,
-                status: "active"
-              });
-            }
-          }
+      for (const gw of allGateways) {
+        const capabilities = GatewayService.getProviderCapabilities(gw);
+        if (!capabilities?.supportsVault) continue;
 
-          // Handle Stripe bank accounts (PaymentMethod API - us_bank_account)
-          if (customerData.banks?.data) {
-            for (const bank of customerData.banks.data) {
-              // Stripe PaymentMethod (us_bank_account) object structure
-              normalizedMethods.push({
-                id: bank.id,
-                type: "bank",
-                provider: "stripe",
-                name: bank.us_bank_account?.bank_name || "Bank Account",
-                last4: bank.us_bank_account?.last4,
-                customerId: bank.customer || customerData.customer?.id,
-                status: "active"
-              });
-            }
-          }
+        let customer = await this.repos.customer.loadByPersonAndProvider(au.churchId, id, gw.provider);
+        if (!customer) customer = await this.repos.customer.loadByPersonId(au.churchId, id);
+        if (!customer) continue;
 
-          // Handle legacy Stripe bank accounts (Sources API - deprecated)
-          if (customerData.legacyBanks?.data) {
-            for (const bank of customerData.legacyBanks.data) {
-              // Legacy Stripe Source (bank_account) object structure
+        try {
+          const gateway = await GatewayService.getGatewayForChurch(au.churchId, { gatewayId: gw.id }, this.repos.gateway);
+          const rawPaymentMethods = await GatewayService.getCustomerPaymentMethods(gateway, customer);
+
+          if (gateway.provider?.toLowerCase() === "stripe" && Array.isArray(rawPaymentMethods)) {
+            for (const customerData of rawPaymentMethods) {
+              if (customerData.cards?.data) {
+                for (const pm of customerData.cards.data) {
+                  normalizedMethods.push({
+                    id: pm.id, type: "card", provider: "stripe",
+                    name: pm.card?.brand || "Card", last4: pm.card?.last4,
+                    customerId: pm.customer || customerData.customer?.id,
+                    gatewayId: gateway.id, status: "active"
+                  });
+                }
+              }
+              if (customerData.banks?.data) {
+                for (const bank of customerData.banks.data) {
+                  normalizedMethods.push({
+                    id: bank.id, type: "bank", provider: "stripe",
+                    name: bank.us_bank_account?.bank_name || "Bank Account",
+                    last4: bank.us_bank_account?.last4,
+                    customerId: bank.customer || customerData.customer?.id,
+                    gatewayId: gateway.id, status: "active"
+                  });
+                }
+              }
+              if (customerData.legacyBanks?.data) {
+                for (const bank of customerData.legacyBanks.data) {
+                  normalizedMethods.push({
+                    id: bank.id, type: "bank", provider: "stripe",
+                    name: "Bank Account", last4: bank.last4,
+                    customerId: bank.customer || customerData.customer?.id,
+                    gatewayId: gateway.id, status: bank.status || "new", isLegacy: true
+                  });
+                }
+              }
+            }
+          } else if (gateway.provider?.toLowerCase() === "paypal" && Array.isArray(rawPaymentMethods)) {
+            const stored = await this.repos.gatewayPaymentMethod.loadByCustomer(au.churchId, gateway.id, customer.id!);
+            const lookup = new Map(stored.map((record) => [record.externalId, record]));
+            for (const method of rawPaymentMethods) {
+              const record = lookup.get(method?.id);
               normalizedMethods.push({
-                id: bank.id,
-                type: "bank",
-                provider: "stripe",
-                name: "Bank Account",
-                last4: bank.last4,
-                customerId: bank.customer || customerData.customer?.id,
-                status: bank.status || "new",
-                isLegacy: true  // Flag to identify legacy sources
+                id: method.id, type: "paypal", provider: "paypal",
+                name: record?.displayName || "PayPal", email: method.email,
+                customerId: record?.customerId || customer.id,
+                gatewayId: gateway.id
+              });
+            }
+          } else if (gateway.provider?.toLowerCase() === "kingdomfunding" && Array.isArray(rawPaymentMethods)) {
+            for (const pm of rawPaymentMethods) {
+              const pmId = String(pm.id);
+              const cardType = pm.card_type || pm.type || "Card";
+              const last4 = pm.last_4 || pm.last4 || "";
+              normalizedMethods.push({
+                id: pmId, type: pm.type === "check" ? "bank" : "card",
+                provider: "kingdomfunding",
+                name: cardType, last4,
+                customerId: customer.id,
+                gatewayId: gateway.id, status: "active"
               });
             }
           }
-        }
-      } else if (gateway.provider?.toLowerCase() === "paypal" && Array.isArray(rawPaymentMethods)) {
-        const stored = await this.repos.gatewayPaymentMethod.loadByCustomer(au.churchId, gateway.id, customer.id!);
-        if (stored.length) {
-          const lookup = new Map(stored.map((record) => [record.externalId, record]));
-          for (const method of rawPaymentMethods) {
-            const record = lookup.get(method?.id);
-            const normalizedMethod = {
-              id: method.id,
-              type: "paypal",
-              provider: "paypal",
-              name: record?.displayName || "PayPal",
-              email: method.email,
-              customerId: record?.customerId || customer.id
-            };
-            normalizedMethods.push(record ? { ...normalizedMethod, localRecord: record } : normalizedMethod);
-          }
-        } else {
-          // No stored records, just normalize what we have
-          for (const method of rawPaymentMethods) {
-            normalizedMethods.push({
-              id: method.id,
-              type: "paypal",
-              provider: "paypal",
-              name: "PayPal",
-              email: method.email,
-              customerId: customer.id
-            });
-          }
+        } catch (e) {
+          console.warn(`Failed to load payment methods for gateway ${gw.id} (${gw.provider}):`, e);
         }
       }
 
@@ -261,25 +237,40 @@ export class PaymentMethodController extends GivingCrudController {
       }
 
       try {
-        const pm = await GatewayService.attachPaymentMethod(gateway, id, { customer });
-        if (gateway.provider === "paypal" && customer) {
-          const tokenId = pm?.id || id;
+        const attachOptions: any = { customer, customerId: customer };
+        // For KingdomFunding nonce-based saves, pass source
+        if (gateway.provider?.toLowerCase() === "kingdomfunding") {
+          attachOptions.source = id;
+          if (req.body.expiry_month) attachOptions.expiry_month = req.body.expiry_month;
+          if (req.body.expiry_year) attachOptions.expiry_year = req.body.expiry_year;
+          if (req.body.cardBrand) attachOptions.cardBrand = req.body.cardBrand;
+          if (req.body.cardLast4) attachOptions.cardLast4 = req.body.cardLast4;
+        }
+
+        const pm = await GatewayService.attachPaymentMethod(gateway, id, attachOptions);
+
+        // Save to gatewayPaymentMethods for non-Stripe providers
+        if ((gateway.provider?.toLowerCase() === "paypal" || gateway.provider?.toLowerCase() === "kingdomfunding") && customer) {
+          const tokenId = pm?.id ? String(pm.id) : id;
           if (tokenId) {
-            const paymentSource = pm?.payment_source || {};
-            const card = paymentSource.card as { last4?: string; brand?: string } | undefined;
-            const paypalSource = paymentSource.paypal as { email_address?: string } | undefined;
+            let methodType = "token";
+            let displayName = "";
 
-            const methodType = card
-              ? "card"
-              : paypalSource
-                ? "paypal"
-                : typeof pm?.type === "string"
-                  ? pm.type
-                  : "token";
-
-            const displayName = card
-              ? `${(card.brand || "Card").toUpperCase()} •••• ${card.last4 ?? ""}`.trim()
-              : paypalSource?.email_address || `PayPal token ${tokenId.substring(0, 6)}...`;
+            if (gateway.provider?.toLowerCase() === "paypal") {
+              const paymentSource = pm?.payment_source || {};
+              const card = paymentSource.card as { last4?: string; brand?: string } | undefined;
+              const paypalSource = paymentSource.paypal as { email_address?: string } | undefined;
+              methodType = card ? "card" : paypalSource ? "paypal" : typeof pm?.type === "string" ? pm.type : "token";
+              displayName = card
+                ? `${(card.brand || "Card").toUpperCase()} •••• ${card.last4 ?? ""}`.trim()
+                : paypalSource?.email_address || `PayPal token ${tokenId.substring(0, 6)}...`;
+            } else {
+              // KingdomFunding
+              const cardType = pm?.card_type || req.body.cardBrand || "Card";
+              const last4 = pm?.last_4 || req.body.cardLast4 || "";
+              methodType = pm?.type === "check" ? "bank" : "card";
+              displayName = `${cardType} •••• ${last4}`.trim();
+            }
 
             const existing = await this.repos.gatewayPaymentMethod.loadByExternalId(cId, gateway.id, tokenId);
             const record: GatewayPaymentMethod = {
@@ -292,8 +283,8 @@ export class PaymentMethodController extends GivingCrudController {
               displayName,
               metadata: {
                 status: pm?.status,
-                brand: card?.brand,
-                last4: card?.last4
+                brand: pm?.card_type || req.body.cardBrand,
+                last4: pm?.last_4 || req.body.cardLast4
               }
             };
             await this.repos.gatewayPaymentMethod.save(record);
@@ -554,32 +545,47 @@ export class PaymentMethodController extends GivingCrudController {
   @httpDelete("/:id/:customerid")
   public async deletePaymentMethod(@requestParam("id") id: string, @requestParam("customerid") customerId: string, req: express.Request<{}, {}, null>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
-      // Determine provider from payment method ID prefix (pm_ and ba_ are Stripe)
+      // Determine provider: pm_ and ba_ are Stripe, otherwise check query param or look up in gatewayPaymentMethods
+      const providerParam = (req.query as any).provider?.toLowerCase();
       const isStripe = id.startsWith("pm_") || id.startsWith("ba_");
-      const gateway = await GatewayService.getGatewayForChurch(au.churchId, { provider: isStripe ? "stripe" : "paypal" }, this.repos.gateway).catch(() => null);
+      let resolvedProvider = providerParam || (isStripe ? "stripe" : null);
+
+      // If provider not determined, look up in gatewayPaymentMethods table
+      if (!resolvedProvider) {
+        const localRecord = await this.repos.gatewayPaymentMethod.loadByExternalIdAcrossGateways(au.churchId, id);
+        if (localRecord) {
+          const gw = (await this.repos.gateway.loadAll(au.churchId) as any[]).find(g => g.id === localRecord.gatewayId);
+          resolvedProvider = gw?.provider?.toLowerCase() || "paypal";
+        } else {
+          resolvedProvider = "paypal"; // fallback for backward compat
+        }
+      }
+
+      const gateway = await GatewayService.getGatewayForChurch(au.churchId, { provider: resolvedProvider }, this.repos.gateway).catch(() => null);
       const permission =
         gateway &&
         (au.checkAccess(Permissions.donations.edit) || (await this.repos.customer.convertToModel(au.churchId, await this.repos.customer.load(au.churchId, customerId)).personId) === au.personId);
       if (!permission) return this.json({}, 401);
-      else {
-        try {
-          if (id.startsWith("ba_")) {
-            await GatewayService.deleteBankAccount(gateway, customerId, id);
-          } else {
-            await GatewayService.detachPaymentMethod(gateway, id);
-          }
 
-          if (gateway.provider === "paypal") {
-            await this.repos.gatewayPaymentMethod.deleteByExternalId(au.churchId, gateway.id, id);
-          }
-
-          return this.json({});
-        } catch (e: any) {
-          return this.json({
-            error: e?.message || "Failed to delete payment method",
-            code: e?.code || "unknown_error"
-          }, e?.statusCode || 500);
+      try {
+        if (id.startsWith("ba_")) {
+          await GatewayService.deleteBankAccount(gateway, customerId, id);
+        } else {
+          await GatewayService.detachPaymentMethod(gateway, id);
         }
+
+        // Clean up local record for non-Stripe providers
+        const prov = gateway.provider?.toLowerCase();
+        if (prov === "paypal" || prov === "kingdomfunding") {
+          await this.repos.gatewayPaymentMethod.deleteByExternalId(au.churchId, gateway.id, id);
+        }
+
+        return this.json({});
+      } catch (e: any) {
+        return this.json({
+          error: e?.message || "Failed to delete payment method",
+          code: e?.code || "unknown_error"
+        }, e?.statusCode || 500);
       }
     });
   }

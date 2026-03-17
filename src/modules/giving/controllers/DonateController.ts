@@ -30,14 +30,26 @@ export class DonateController extends GivingCrudController {
       const gateways = (await this.repos.gateway.loadAll(churchId)) as any[];
 
       // Return gateway info without sensitive data
-      const publicGateways = gateways.map(gateway => ({
-        id: gateway.id,
-        provider: gateway.provider,
-        publicKey: gateway.publicKey,
-        productId: gateway.productId,
-        payFees: gateway.payFees,
-        currency: gateway.currency
-      }));
+      const publicGateways = gateways.map(gateway => {
+        const base: any = {
+          id: gateway.id,
+          provider: gateway.provider,
+          publicKey: gateway.publicKey,
+          productId: gateway.productId,
+          payFees: gateway.payFees,
+          currency: gateway.currency,
+          enabled: gateway.enabled,
+          environment: gateway.environment || null
+        };
+        // Include non-sensitive settings for frontend (e.g. sandbox flag)
+        if (gateway.settings) {
+          try {
+            const settings = typeof gateway.settings === "string" ? JSON.parse(gateway.settings) : gateway.settings;
+            base.settings = { sandbox: settings.sandbox || false };
+          } catch { /* ignore parse errors */ }
+        }
+        return base;
+      });
 
       return { gateways: publicGateways };
     });
@@ -208,29 +220,38 @@ export class DonateController extends GivingCrudController {
   }
 
   private shouldProcessDonation(provider: string, eventType: string): boolean {
-    const donationEvents = {
+    const donationEvents: Record<string, string[]> = {
       // payment_intent.processing is for ACH payments that are pending
       // payment_intent.succeeded is the new standard for ACH payments via Payment Intents API
       // charge.succeeded is kept for backward compatibility during migration
       stripe: ["charge.succeeded", "invoice.paid", "payment_intent.succeeded", "payment_intent.processing"],
-      paypal: ["PAYMENT.CAPTURE.COMPLETED"]
+      paypal: ["PAYMENT.CAPTURE.COMPLETED"],
+      // KingdomFunding webhook events: "succeeded.charge" for card/ACH, "status.settled" for ACH settlement
+      kingdomfunding: ["succeeded.charge", "status.settled"],
     };
-    return donationEvents[provider as keyof typeof donationEvents]?.includes(eventType) || false;
+    return donationEvents[provider]?.includes(eventType) || false;
   }
 
   private isPendingPayment(provider: string, eventType: string): boolean {
-    // ACH payments start in "processing" state and later transition to "succeeded"
-    return provider === "stripe" && eventType === "payment_intent.processing";
+    // ACH payments start in "processing" state and later transition to "succeeded"/"settled"
+    if (provider === "stripe") return eventType === "payment_intent.processing";
+    // KingdomFunding ACH: initial charge succeeds but needs settlement confirmation
+    if (provider === "kingdomfunding") return eventType === "status.originated" || eventType === "status.pending";
+    return false;
   }
 
   private isCompletedPayment(provider: string, eventType: string): boolean {
-    // Check if this is a payment completion event (for updating pending -> complete)
-    return provider === "stripe" && eventType === "payment_intent.succeeded";
+    if (provider === "stripe") return eventType === "payment_intent.succeeded";
+    if (provider === "kingdomfunding") return eventType === "status.settled" || eventType === "succeeded.charge";
+    return false;
   }
 
   private shouldCancelSubscription(provider: string, eventType: string): boolean {
-    const cancellationEvents = { stripe: ["customer.subscription.deleted"], paypal: ["BILLING.SUBSCRIPTION.CANCELLED"] };
-    return cancellationEvents[provider as keyof typeof cancellationEvents]?.includes(eventType) || false;
+    const cancellationEvents: Record<string, string[]> = {
+      stripe: ["customer.subscription.deleted"],
+      paypal: ["BILLING.SUBSCRIPTION.CANCELLED"],
+    };
+    return cancellationEvents[provider]?.includes(eventType) || false;
   }
 
   @httpPost("/replay-stripe-events")
@@ -419,7 +440,11 @@ export class DonateController extends GivingCrudController {
           await GatewayService.logDonation(gateway, churchId, chargeResult.data, this.repos);
         }
 
-        await this.sendEmails(donationData.person.email, donationData?.church, donationData.funds, donationData?.amount, donationData?.interval, donationData?.billing_cycle_anchor, "one-time");
+        try {
+          await this.sendEmails(donationData.person.email, donationData?.church, donationData.funds, donationData?.amount, donationData?.interval, donationData?.billing_cycle_anchor, "one-time");
+        } catch (emailErr) {
+          console.warn("Charge: Failed to send confirmation email (non-fatal)", emailErr);
+        }
 
         return { ...chargeResult.data, provider: gateway.provider };
       } catch (error) {
@@ -432,7 +457,7 @@ export class DonateController extends GivingCrudController {
   @httpPost("/subscribe")
   public async subscribe(req: express.Request<any>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
-      const { id, amount, customerId, type, billing_cycle_anchor, proration_behavior, interval, funds, person, notes, churchId: CHURCH_ID, provider, gatewayId, currency } = req.body;
+      const { id, amount, customerId, type, billing_cycle_anchor, proration_behavior, interval, funds, person, notes, churchId: CHURCH_ID, provider, gatewayId, currency, expiry_month, expiry_year } = req.body;
       const churchId = au.churchId || CHURCH_ID;
 
       // Validate required parameters
@@ -462,7 +487,12 @@ export class DonateController extends GivingCrudController {
           billing_cycle_anchor,
           proration_behavior,
           interval,
-          notes
+          notes,
+          person,
+          name: person?.name?.display || person?.name || "",
+          email: person?.email || "",
+          expiry_month,
+          expiry_year,
         };
 
         const subscriptionResult = await GatewayService.createSubscription(gateway, subscriptionData);
@@ -493,9 +523,16 @@ export class DonateController extends GivingCrudController {
         });
 
         await Promise.all(promises);
-        await this.sendEmails(person.email, req.body?.church, funds, amount, interval, billing_cycle_anchor, "recurring");
 
-        return { ...subscriptionResult.data, provider: gateway.provider };
+        try {
+          await this.sendEmails(person.email, req.body?.church, funds, amount, interval, billing_cycle_anchor, "recurring");
+        } catch (emailErr) {
+          console.warn("Subscribe: Failed to send confirmation email (non-fatal)", emailErr);
+        }
+
+        // Normalize status for frontend compatibility
+        const normalizedStatus = (subscriptionResult.data?.status || "active").toLowerCase();
+        return { ...subscriptionResult.data, provider: gateway.provider, status: normalizedStatus };
       } catch (error) {
         console.error("Subscription creation failed:", error);
         return this.json({ error: "Subscription creation failed" }, 500);
