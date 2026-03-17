@@ -211,11 +211,13 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         };
       }
 
-      // Add customer reference if available
+      // Add customer reference if available (Accept Blue expects numeric customer_id)
       if (donationData.customerId) {
-        payload.customer_id = donationData.customerId;
+        const cid = Number(donationData.customerId);
+        payload.customer_id = isNaN(cid) ? donationData.customerId : cid;
       }
 
+      console.log("KF charge payload:", JSON.stringify({ url: `${baseUrl}/transactions/charge`, source: payload.source, amount: payload.amount, customer_id: payload.customer_id }));
       const response = await Axios.post(
         `${baseUrl}/transactions/charge`,
         payload,
@@ -246,11 +248,17 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
       };
     } catch (error: any) {
       const errData = error.response?.data || {};
-      console.error("KingdomFunding processCharge error:", errData.error_message || error.message);
+      const status = error.response?.status;
+      // Accept Blue sometimes returns HTML error pages (e.g. nginx 500/502/503)
+      const isHtmlError = typeof errData === "string" && errData.includes("<html");
+      const errorMsg = isHtmlError
+        ? `Accept Blue server error (HTTP ${status}). Please try again.`
+        : (errData.error_message || errData.error_details || error.message || "Charge failed");
+      console.error("KingdomFunding processCharge error:", JSON.stringify({ status, isHtmlError, message: errorMsg }));
       return {
         success: false,
         transactionId: "",
-        data: { error: errData.error_message || errData.error_details || error.message || "Charge failed" }
+        data: { error: errorMsg }
       };
     }
   }
@@ -781,10 +789,11 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
       const payload: any = {};
 
-      if (options.source || paymentMethodId.startsWith("nonce-")) {
-        // Save from a nonce token
+      if (options.source || paymentMethodId.startsWith("nonce-") || paymentMethodId.startsWith("ref-")) {
+        // Save from a nonce token or transaction reference
         payload.source = options.source || paymentMethodId;
-        if (!payload.source.startsWith("nonce-")) payload.source = `nonce-${payload.source}`;
+        // Only auto-prefix with nonce- if it's not already prefixed
+        if (!payload.source.startsWith("nonce-") && !payload.source.startsWith("ref-")) payload.source = `nonce-${payload.source}`;
       } else if (options.routing_number) {
         // Save a check/ACH payment method
         payload.routing_number = options.routing_number;
@@ -861,12 +870,26 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         amount = eventData.transaction.amount_details.amount;
       }
 
-      // Find person from customer data
+      // Find person — from direct person data (charge flow) or from customer/transaction lookup (webhook flow)
       let personId: string | undefined;
-      const customerId = eventData.customer?.customer_id || eventData.transaction?.customer?.customer_id;
-      if (customerId) {
-        const customer = await repos.customer.load(churchId, String(customerId));
-        if (customer) personId = customer.personId;
+      if (eventData.person?.id) {
+        personId = eventData.person.id;
+      } else {
+        // Try customer_id from webhook body
+        const customerId = eventData.customer?.customer_id || eventData.transaction?.customer?.customer_id;
+        if (customerId) {
+          const customer = await repos.customer.load(churchId, String(customerId));
+          if (customer) personId = customer.personId;
+        }
+
+        // Fallback: look up by reference_number in existing donations (charge endpoint logs first)
+        if (!personId) {
+          const refNum = eventData.reference_number || eventData.transaction?.id;
+          if (refNum) {
+            const existingDonation = await repos.donation.loadByTransactionId(churchId, String(refNum));
+            if (existingDonation?.personId) personId = existingDonation.personId;
+          }
+        }
       }
 
       // Determine payment method type
@@ -878,36 +901,40 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
       const batch: DonationBatch = await repos.donationBatch.getOrCreateCurrent(churchId);
 
+      const refNumber = String(eventData.reference_number || eventData.transaction?.id || eventData.id || "");
+
       const donation: Donation = {
         churchId,
         batchId: batch.id,
         personId,
+        transactionId: refNumber,
         donationDate: new Date(),
         amount,
         method,
         methodDetails,
-        notes: `KingdomFunding ref: ${eventData.reference_number || eventData.id || ""}`,
+        notes: `KingdomFunding ref: ${refNumber}`,
       };
 
       const savedDonation = await repos.donation.save(donation);
 
-      // If there's subscription fund allocation, use it
-      if (eventData.subscriptionFunds?.length) {
-        for (const fund of eventData.subscriptionFunds) {
+      // Allocate funds: subscription funds, charge funds array, or single fund fallback
+      const fundsArray = eventData.subscriptionFunds || eventData.funds || [];
+      if (fundsArray.length > 0) {
+        for (const fund of fundsArray) {
           const fundDonation: FundDonation = {
             churchId,
             donationId: savedDonation.id,
-            fundId: fund.fundId,
-            amount: fund.amount,
+            fundId: fund.fundId || fund.id || "",
+            amount: fund.amount || 0,
           };
           await repos.fundDonation.save(fundDonation);
         }
-      } else {
+      } else if (eventData.fundId) {
         // Single fund donation — use the total amount
         const fundDonation: FundDonation = {
           churchId,
           donationId: savedDonation.id,
-          fundId: eventData.fundId || "",
+          fundId: eventData.fundId,
           amount,
         };
         await repos.fundDonation.save(fundDonation);

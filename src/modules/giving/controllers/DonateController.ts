@@ -1,5 +1,6 @@
 import { controller, httpPost, httpGet } from "inversify-express-utils";
 import express from "express";
+import crypto from "crypto";
 import { GivingCrudController } from "./GivingCrudController.js";
 import { Permissions } from "../../../shared/helpers/Permissions.js";
 import { GatewayService } from "../../../shared/helpers/GatewayService.js";
@@ -219,6 +220,107 @@ export class DonateController extends GivingCrudController {
     });
   }
 
+  /**
+   * Test endpoint: process a webhook payload without signature verification.
+   * Non-production only. Useful for local Postman testing.
+   */
+  @httpPost("/webhook-test/:provider")
+  public async webhookTest(req: express.Request<{ provider: string }, {}, any>, res: express.Response): Promise<any> {
+    return this.actionWrapperAnon(req, res, async () => {
+      if (Environment.appEnv === "prod" || Environment.appEnv === "production") {
+        return this.json({ error: "Test endpoint not available in production" }, 403);
+      }
+
+      const churchId = req.query.churchId?.toString();
+      if (!churchId) return this.json({ error: "Missing churchId parameter" }, 400);
+
+      const provider = req.params.provider?.toLowerCase();
+      const gateways = (await this.repos.gateway.loadAll(churchId)) as any[];
+      const gateway = gateways.find(g => g.provider.toLowerCase() === provider);
+      if (!gateway) return this.json({ error: `No ${provider} gateway configured` }, 404);
+
+      const body = req.body;
+      let eventType = "";
+      if (provider === "kingdomfunding") {
+        eventType = body.subType ? `${body.type}.${body.subType}` : body.type || "";
+      } else if (provider === "stripe") {
+        eventType = body.type || "";
+      } else if (provider === "paypal") {
+        eventType = body.event_type || "";
+      }
+
+      const eventId = body.id || `test-${Date.now()}`;
+      const eventData = body.data || body;
+
+      try {
+        await GatewayService.logEvent(gateway, churchId, body, eventData, this.repos);
+
+        let donationResult = null;
+        if (this.shouldProcessDonation(provider, eventType)) {
+          const isPending = this.isPendingPayment(provider, eventType);
+          const isCompleted = this.isCompletedPayment(provider, eventType);
+          const transactionId = eventData?.id;
+
+          if (isCompleted && transactionId) {
+            const existingDonation = await this.repos.donation.loadByTransactionId(churchId, transactionId);
+            if (existingDonation) {
+              await GatewayService.updateDonationStatus(gateway, churchId, transactionId, "complete", this.repos);
+              donationResult = { action: "updated_to_complete", transactionId };
+            } else {
+              donationResult = await GatewayService.logDonation(gateway, churchId, eventData, this.repos, "complete");
+            }
+          } else if (isPending) {
+            donationResult = await GatewayService.logDonation(gateway, churchId, eventData, this.repos, "pending");
+          } else {
+            donationResult = await GatewayService.logDonation(gateway, churchId, eventData, this.repos, "complete");
+          }
+        }
+
+        return { success: true, eventId, eventType, provider, donationProcessed: !!donationResult, donationResult };
+      } catch (error: any) {
+        return this.json({ error: "Webhook test processing failed", details: error.message }, 500);
+      }
+    });
+  }
+
+  /**
+   * Generate an HMAC signature for testing the real webhook endpoint.
+   * Non-production only. Returns signature + sample curl command.
+   */
+  @httpPost("/webhook-sign/:provider")
+  public async webhookSign(req: express.Request<{ provider: string }, {}, any>, res: express.Response): Promise<any> {
+    return this.actionWrapperAnon(req, res, async () => {
+      if (Environment.appEnv === "prod" || Environment.appEnv === "production") {
+        return this.json({ error: "Sign endpoint not available in production" }, 403);
+      }
+
+      const churchId = req.query.churchId?.toString();
+      if (!churchId) return this.json({ error: "Missing churchId parameter" }, 400);
+
+      const provider = req.params.provider?.toLowerCase();
+      const gateways = (await this.repos.gateway.loadAll(churchId)) as any[];
+      const gateway = gateways.find(g => g.provider.toLowerCase() === provider);
+      if (!gateway) return this.json({ error: `No ${provider} gateway configured` }, 404);
+
+      const config = GatewayService.getGatewayConfig(gateway);
+      if (!config.webhookKey) {
+        return this.json({ error: "No webhook key configured for this gateway" }, 400);
+      }
+
+      const bodyStr = JSON.stringify(req.body);
+      const signature = crypto.createHmac("sha256", config.webhookKey).update(bodyStr).digest("hex");
+
+      const port = req.socket.localPort || 8084;
+      const webhookUrl = `http://localhost:${port}/giving/donate/webhook/${provider}?churchId=${churchId}`;
+
+      return {
+        signature,
+        header: "X-Signature",
+        curl: `curl -X POST "${webhookUrl}" -H "Content-Type: application/json" -H "X-Signature: ${signature}" -d '${bodyStr.replace(/'/g, "'\\''")}'`
+      };
+    });
+  }
+
   private shouldProcessDonation(provider: string, eventType: string): boolean {
     const donationEvents: Record<string, string[]> = {
       // payment_intent.processing is for ACH payments that are pending
@@ -428,16 +530,127 @@ export class DonateController extends GivingCrudController {
       donationData.currency = normalizedCurrency;
 
       try {
+        // KingdomFunding + saveCard: create customer & payment method BEFORE charging,
+        // then charge with the saved pm-{id} instead of the single-use nonce.
+        // Flow: Create customer → Add payment method (nonce) → Charge with pm-{id}
+        // Uses GatewayService (not direct Axios) so credentials are decrypted and URLs are correct.
+        if (donationData.saveCard && gateway.provider?.toLowerCase() === "kingdomfunding") {
+          try {
+            const personEmail = donationData.person?.email || "";
+            const personName = donationData.person?.name || donationData.name || "";
+            const personId = donationData.person?.id;
+
+            // Step 1: Find or create customer via GatewayService
+            let customerId: string | undefined;
+            if (personId) {
+              const existingCustomer = await this.repos.customer.loadByPersonAndProvider(churchId, personId, "kingdomfunding") as any;
+              if (existingCustomer) customerId = existingCustomer.id;
+            }
+            if (!customerId) {
+              customerId = await GatewayService.createCustomer(gateway, personEmail, personName);
+              if (customerId && personId) {
+                await this.repos.customer.save({ id: customerId, churchId, personId, provider: "kingdomfunding" });
+              }
+            }
+
+            if (customerId) {
+              // Step 2: Attach payment method using nonce via GatewayService
+              const nonceToken = donationData.token || donationData.id || "";
+              const nonceSource = nonceToken.startsWith("nonce-") ? nonceToken : `nonce-${nonceToken}`;
+
+              const attachOptions: any = {
+                customerId,
+                source: nonceSource,
+                name: personName,
+              };
+              if (donationData.expiry_month) attachOptions.expiry_month = Number(donationData.expiry_month);
+              if (donationData.expiry_year) {
+                let ey = Number(donationData.expiry_year);
+                if (ey > 0 && ey < 100) ey += 2000;
+                attachOptions.expiry_year = ey;
+              }
+
+              let pm: any;
+              try {
+                pm = await GatewayService.attachPaymentMethod(gateway, nonceSource, attachOptions);
+              } catch (attachErr: any) {
+                // Customer doesn't exist on provider (stale local record) — recreate and retry
+                const status = attachErr.response?.status || attachErr.statusCode;
+                if (status === 404) {
+                  console.log(`Customer ${customerId} not found on Accept Blue, recreating...`);
+                  customerId = await GatewayService.createCustomer(gateway, personEmail, personName);
+                  if (customerId && personId) {
+                    await this.repos.customer.save({ id: customerId, churchId, personId, provider: "kingdomfunding" });
+                  }
+                  if (customerId) {
+                    attachOptions.customerId = customerId;
+                    pm = await GatewayService.attachPaymentMethod(gateway, nonceSource, attachOptions);
+                  } else {
+                    throw attachErr;
+                  }
+                } else {
+                  throw attachErr;
+                }
+              }
+
+              const savedPmId = pm?.id;
+              if (savedPmId) {
+                // Save payment method locally
+                const cardType = pm.card_type || donationData.cardBrand || "Card";
+                const last4 = pm.last_4 || donationData.cardLast4 || "";
+                await this.repos.gatewayPaymentMethod.save({
+                  churchId, gatewayId: gateway.id, customerId,
+                  externalId: String(savedPmId),
+                  methodType: donationData.type === "check" ? "bank" : "card",
+                  displayName: `${cardType} ****${last4}`,
+                  metadata: { card_type: cardType, last_4: last4 }
+                } as any);
+
+                // Step 3: Charge using the saved payment method instead of the nonce
+                donationData.paymentMethodId = String(savedPmId);
+                donationData.customerId = customerId;
+                delete donationData.id;     // Remove nonce so processCharge uses pm-{id}
+                delete donationData.token;
+              }
+            }
+          } catch (saveCardErr: any) {
+            console.warn("Charge: Failed to save card before charge (non-fatal, charging with nonce):", saveCardErr.response?.data || saveCardErr.message);
+            // Fall through — charge will proceed with original nonce
+          }
+        }
+
+        // KF saved payment method: the frontend sends id="54879" (a numeric PM ID from Accept Blue).
+        // The KF provider treats id as a nonce (nonce-54879) which is wrong.
+        // Detect numeric IDs and move them to paymentMethodId so the provider uses pm-{id} instead.
+        if (gateway.provider?.toLowerCase() === "kingdomfunding" && donationData.id && !donationData.paymentMethodId) {
+          const id = String(donationData.id);
+          if (/^\d+$/.test(id)) {
+            donationData.paymentMethodId = id;
+            delete donationData.id;
+          }
+        }
+
         const chargeResult = await GatewayService.processCharge(gateway, donationData);
 
         if (!chargeResult.success) {
-          return this.json({ error: chargeResult.error || "Charge processing failed" }, 400);
+          return this.json({ error: chargeResult.data?.error || chargeResult.error || "Charge processing failed" }, 400);
         }
 
-        // For PayPal, we need to log the events since it's captured immediately
-        if (gateway.provider === "paypal") {
-          await GatewayService.logEvent(gateway, churchId, chargeResult.data, chargeResult.data, this.repos);
-          await GatewayService.logDonation(gateway, churchId, chargeResult.data, this.repos);
+        // For PayPal and KingdomFunding, log the donation immediately (no webhook flow)
+        if (gateway.provider === "paypal" || gateway.provider?.toLowerCase() === "kingdomfunding") {
+          try {
+            await GatewayService.logEvent(gateway, churchId, chargeResult.data, chargeResult.data, this.repos);
+            const logData = {
+              ...chargeResult.data,
+              amount: donationData.amount,
+              funds: donationData.funds,
+              person: donationData.person,
+              notes: donationData.notes,
+            };
+            await GatewayService.logDonation(gateway, churchId, logData, this.repos, "complete");
+          } catch (logErr) {
+            console.warn("Charge: Failed to log donation (non-fatal)", logErr);
+          }
         }
 
         try {
@@ -495,18 +708,31 @@ export class DonateController extends GivingCrudController {
           expiry_year,
         };
 
+        // For KF: pass existing local customer ID so provider can reuse it
+        if (gateway.provider?.toLowerCase() === "kingdomfunding" && person?.id && !subscriptionData.customerId) {
+          const existingKFCustomer = await this.repos.customer.loadByPersonAndProvider(churchId, person.id, "kingdomfunding") as any;
+          if (existingKFCustomer?.id) subscriptionData.customerId = existingKFCustomer.id;
+        }
+
         const subscriptionResult = await GatewayService.createSubscription(gateway, subscriptionData);
 
         if (!subscriptionResult.success) {
           return this.json({ error: "Subscription creation failed" }, 400);
         }
 
+        // Save the KF customer ID locally (created during subscription on Accept Blue)
+        const abCustomerId = subscriptionResult.data?.customerId ? String(subscriptionResult.data.customerId) : customerId;
+        if (gateway.provider?.toLowerCase() === "kingdomfunding" && abCustomerId && person?.id) {
+          try {
+            await this.repos.customer.save({ id: abCustomerId, churchId, personId: person.id, provider: "kingdomfunding" });
+          } catch (_e) { /* customer may already exist, ignore */ }
+        }
+
         const subscription: Subscription = {
           id: subscriptionResult.subscriptionId,
           churchId,
           personId: person.id,
-          customerId,
-          gatewayId: gateway.id
+          customerId: abCustomerId || customerId,
         };
 
         await this.repos.subscription.save(subscription);
@@ -782,6 +1008,7 @@ export class DonateController extends GivingCrudController {
       }
     });
   }
+
 
   /**
    * Get gateway by provider name or ID using the centralized helper

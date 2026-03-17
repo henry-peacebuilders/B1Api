@@ -224,7 +224,12 @@ export class PaymentMethodController extends GivingCrudController {
         return this.json({ error: "Invalid payment method ID format" }, 400);
       }
 
+      // For non-Stripe providers, look up the provider-specific customer instead of using the passed-in (Stripe) customer ID
       let customer = customerId;
+      if (gateway.provider?.toLowerCase() !== "stripe" && personId) {
+        const providerCustomer = await this.repos.customer.loadByPersonAndProvider(cId, personId, gateway.provider) as any;
+        customer = providerCustomer?.id || undefined;
+      }
       if (!customer) {
         try {
           customer = await GatewayService.createCustomer(gateway, email, name);
@@ -237,17 +242,38 @@ export class PaymentMethodController extends GivingCrudController {
       }
 
       try {
-        const attachOptions: any = { customer, customerId: customer };
-        // For KingdomFunding nonce-based saves, pass source
-        if (gateway.provider?.toLowerCase() === "kingdomfunding") {
-          attachOptions.source = id;
-          if (req.body.expiry_month) attachOptions.expiry_month = req.body.expiry_month;
-          if (req.body.expiry_year) attachOptions.expiry_year = req.body.expiry_year;
-          if (req.body.cardBrand) attachOptions.cardBrand = req.body.cardBrand;
-          if (req.body.cardLast4) attachOptions.cardLast4 = req.body.cardLast4;
-        }
+        const buildAttachOptions = (custId: string) => {
+          const opts: any = { customer: custId, customerId: custId };
+          if (gateway.provider?.toLowerCase() === "kingdomfunding") {
+            opts.source = id;
+            if (req.body.expiry_month) opts.expiry_month = req.body.expiry_month;
+            if (req.body.expiry_year) opts.expiry_year = req.body.expiry_year;
+            if (req.body.cardBrand) opts.cardBrand = req.body.cardBrand;
+            if (req.body.cardLast4) opts.cardLast4 = req.body.cardLast4;
+          }
+          return opts;
+        };
 
-        const pm = await GatewayService.attachPaymentMethod(gateway, id, attachOptions);
+        let pm: any;
+        try {
+          pm = await GatewayService.attachPaymentMethod(gateway, id, buildAttachOptions(customer));
+        } catch (attachErr: any) {
+          // If customer doesn't exist on the provider (404/Not Found), recreate and retry
+          const status = attachErr.response?.status || attachErr.statusCode;
+          if (status === 404 && gateway.provider?.toLowerCase() !== "stripe") {
+            console.log(`Customer ${customer} not found on ${gateway.provider}, recreating...`);
+            const newCustomer = await GatewayService.createCustomer(gateway, email, name);
+            if (newCustomer) {
+              await this.repos.customer.save({ id: newCustomer, churchId: cId, personId, provider: gateway.provider });
+              customer = newCustomer;
+              pm = await GatewayService.attachPaymentMethod(gateway, id, buildAttachOptions(customer));
+            } else {
+              throw attachErr;
+            }
+          } else {
+            throw attachErr;
+          }
+        }
 
         // Save to gatewayPaymentMethods for non-Stripe providers
         if ((gateway.provider?.toLowerCase() === "paypal" || gateway.provider?.toLowerCase() === "kingdomfunding") && customer) {
