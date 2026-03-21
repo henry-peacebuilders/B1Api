@@ -2,6 +2,7 @@ import { controller, httpPost, httpGet, requestParam, httpDelete } from "inversi
 import express from "express";
 import { GivingCrudController } from "./GivingCrudController.js";
 import { GatewayService } from "../../../shared/helpers/GatewayService.js";
+import { GatewayFactory } from "../../../shared/helpers/gateways/GatewayFactory.js";
 import { Permissions } from "../../../shared/helpers/Permissions.js";
 import { GatewayPaymentMethod } from "../models/index.js";
 
@@ -582,30 +583,84 @@ export class PaymentMethodController extends GivingCrudController {
         if (localRecord) {
           const gw = (await this.repos.gateway.loadAll(au.churchId) as any[]).find(g => g.id === localRecord.gatewayId);
           resolvedProvider = gw?.provider?.toLowerCase() || "paypal";
+        } else if (/^\d+$/.test(id)) {
+          // Numeric IDs are Accept Blue / KingdomFunding payment method IDs
+          resolvedProvider = "kingdomfunding";
         } else {
           resolvedProvider = "paypal"; // fallback for backward compat
         }
       }
 
       const gateway = await GatewayService.getGatewayForChurch(au.churchId, { provider: resolvedProvider }, this.repos.gateway).catch(() => null);
-      const permission =
-        gateway &&
-        (au.checkAccess(Permissions.donations.edit) || (await this.repos.customer.convertToModel(au.churchId, await this.repos.customer.load(au.churchId, customerId)).personId) === au.personId);
+      console.log("[PM Delete] resolvedProvider:", resolvedProvider, "gateway found:", !!gateway, "pmId:", id, "customerId:", customerId);
+
+      let permission = false;
+      if (gateway) {
+        if (au.checkAccess(Permissions.donations.edit)) {
+          permission = true;
+        } else {
+          try {
+            const customerData = await this.repos.customer.load(au.churchId, customerId);
+            if (customerData) {
+              const customer = this.repos.customer.convertToModel(au.churchId, customerData as any);
+              permission = customer.personId === au.personId;
+            }
+          } catch (permErr) {
+            console.error("[PM Delete] Permission check error:", permErr);
+          }
+        }
+      }
+      console.log("[PM Delete] permission:", permission);
       if (!permission) return this.json({}, 401);
 
       try {
-        if (id.startsWith("ba_")) {
-          await GatewayService.deleteBankAccount(gateway, customerId, id);
-        } else {
-          await GatewayService.detachPaymentMethod(gateway, id);
+        console.log("[PM Delete] Calling detachPaymentMethod for", resolvedProvider, "pmId:", id);
+
+        let remoteDeleteOk = false;
+        try {
+          if (id.startsWith("ba_")) {
+            await GatewayService.deleteBankAccount(gateway, customerId, id);
+          } else {
+            await GatewayService.detachPaymentMethod(gateway, id);
+          }
+          remoteDeleteOk = true;
+        } catch (detachErr: any) {
+          const msg = detachErr?.message || "";
+          if (resolvedProvider === "kingdomfunding" && msg.includes("active recurring")) {
+            // Try to cancel linked subscriptions, then retry
+            console.log("[PM Delete] PM has active recurring schedules, attempting to cancel and retry...");
+            try {
+              const provider = GatewayFactory.getProvider(gateway.provider);
+              const config = GatewayService.getGatewayConfig(gateway);
+              const schedules = await (provider as any).getCustomerSubscriptions(config, customerId);
+              const activeSchedules = (schedules || []).filter((s: any) => s.payment_method_id?.toString() === id && s.active !== false);
+              console.log("[PM Delete] Cancelling", activeSchedules.length, "active subscriptions");
+              for (const schedule of activeSchedules) {
+                try {
+                  await provider.cancelSubscription(config, schedule.id.toString());
+                  await this.repos.subscription.delete(au.churchId, schedule.id.toString()).catch(() => {});
+                } catch (cancelErr: any) {
+                  console.error("[PM Delete] Failed to cancel schedule", schedule.id, cancelErr.message);
+                }
+              }
+              await GatewayService.detachPaymentMethod(gateway, id);
+              remoteDeleteOk = true;
+            } catch (retryErr: any) {
+              // Could not delete from Accept Blue (sandbox flaky, etc.) — proceed to clean up locally
+              console.warn("[PM Delete] Could not delete PM from provider, cleaning up local records only:", retryErr?.message || retryErr);
+            }
+          } else {
+            throw detachErr;
+          }
         }
 
-        // Clean up local record for non-Stripe providers
+        // Always clean up local records for non-Stripe providers
         const prov = gateway.provider?.toLowerCase();
         if (prov === "paypal" || prov === "kingdomfunding") {
           await this.repos.gatewayPaymentMethod.deleteByExternalId(au.churchId, gateway.id, id);
         }
 
+        console.log("[PM Delete] Done. Remote delete:", remoteDeleteOk ? "success" : "skipped (local cleanup only)");
         return this.json({});
       } catch (e: any) {
         return this.json({

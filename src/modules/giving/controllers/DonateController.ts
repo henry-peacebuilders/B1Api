@@ -648,8 +648,8 @@ export class DonateController extends GivingCrudController {
               notes: donationData.notes,
             };
             await GatewayService.logDonation(gateway, churchId, logData, this.repos, "complete");
-          } catch (logErr) {
-            console.warn("Charge: Failed to log donation (non-fatal)", logErr);
+          } catch (logErr: any) {
+            console.error("Charge: Failed to log donation:", logErr?.message || logErr, logErr?.stack);
           }
         }
 
@@ -975,6 +975,10 @@ export class DonateController extends GivingCrudController {
   public async captchaVerify(req: express.Request<{}, {}, { token: string }>, res: express.Response): Promise<any> {
     return this.actionWrapperAnon(req, res, async () => {
       try {
+        // In dev mode, always return human to speed up testing
+        if (Environment.currentEnvironment === "dev") {
+          return { response: "human" };
+        }
         // detecting if its a bot or a human
         const { token } = req.body;
         const response = await Axios.post(`https://www.google.com/recaptcha/api/siteverify?secret=${Environment.googleRecaptchaSecretKey}&response=${token}`);

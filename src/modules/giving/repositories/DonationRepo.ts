@@ -64,11 +64,11 @@ export class DonationRepo extends ConfiguredRepo<Donation> {
 
   public loadByPersonId(churchId: string, personId: string) {
     const sql =
-      "SELECT d.*, f.id as fundId, IFNULL(f.name, 'Unkown') as fundName, fd.amount as fundAmount" +
+      "SELECT d.*, f.id as fundId, IFNULL(f.name, 'Unknown') as fundName, fd.amount as fundAmount" +
       " FROM donations d" +
-      " INNER JOIN fundDonations fd on fd.donationId = d.id" +
+      " LEFT JOIN fundDonations fd on fd.donationId = d.id" +
       " LEFT JOIN funds f on f.id = fd.fundId" +
-      " WHERE d.churchId = ? AND d.personId = ? AND (f.taxDeductible = 1 OR f.taxDeductible IS NULL)" +
+      " WHERE d.churchId = ? AND d.personId = ? AND (f.taxDeductible = 1 OR f.taxDeductible IS NULL OR fd.id IS NULL)" +
       " ORDER BY d.donationDate DESC";
     return TypedDB.query(sql, [churchId, personId]);
   }

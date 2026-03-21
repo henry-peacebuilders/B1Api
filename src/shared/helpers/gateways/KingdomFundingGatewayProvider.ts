@@ -293,7 +293,7 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         payload.routing_number = donationData.routing_number;
         payload.account_number = donationData.account_number;
         payload.account_type = donationData.account_type || "checking";
-        payload.sec_code = donationData.sec_code || "web";
+        payload.sec_code = donationData.sec_code || "WEB";
       } else {
         return { success: false, transactionId: "", data: { error: "Missing bank payment data" } };
       }
@@ -417,9 +417,11 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
       let customerId = subscriptionData.customerId;
       let referenceNumber: number | null = null;
+      console.log("[KF createSubscription] startsToday:", startsToday, "customerId:", customerId, "nonceSource:", nonceSource ? nonceSource.substring(0, 20) + "..." : "none", "token:", token ? token.substring(0, 20) + "..." : "none");
 
       // Step 2: If starts today, charge immediately first
       if (startsToday && nonceSource) {
+        console.log("[KF createSubscription] Step 2: Charging immediately", { amount: subscriptionData.amount, source: nonceSource.substring(0, 20) });
         const chargePayload: any = {
           amount: subscriptionData.amount,
           source: nonceSource,
@@ -428,6 +430,7 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         if (expiryMonth) chargePayload.expiry_month = expiryMonth;
         if (expiryYear) chargePayload.expiry_year = expiryYear;
 
+        console.log("[KF createSubscription] Step 2: POST", `${baseUrl}/transactions/charge`);
         const chargeResponse = await Axios.post(
           `${baseUrl}/transactions/charge`,
           chargePayload,
@@ -435,6 +438,7 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         );
 
         referenceNumber = chargeResponse.data?.reference_number;
+        console.log("[KF createSubscription] Step 2 result: ref#", referenceNumber);
         if (!referenceNumber) {
           const errMsg = chargeResponse.data?.error_message || "Initial charge failed";
           console.error("KingdomFunding: Initial recurring charge failed", chargeResponse.data);
@@ -442,23 +446,11 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         }
       }
 
-      // Step 3: Create customer (from transaction if we charged, otherwise standalone)
+      // Step 3: Create customer
       if (!customerId) {
-        if (referenceNumber) {
-          // Create customer from the transaction
-          const custPayload: any = { reference_number: referenceNumber };
-          if (email) custPayload.email = email;
-          const custResponse = await Axios.post(
-            `${baseUrl}/customers/from-transaction`,
-            custPayload,
-            this.axiosConfig(config)
-          );
-          customerId = custResponse.data?.id;
-        }
-
-        if (!customerId) {
-          customerId = await this.createCustomer(config, email, name);
-        }
+        console.log("[KF createSubscription] Step 3: Creating customer", { email, name });
+        customerId = await this.createCustomer(config, email, name);
+        console.log("[KF createSubscription] Step 3 result: customerId", customerId);
       }
 
       // Step 4: Create payment method on the customer
@@ -470,6 +462,8 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         if (referenceNumber) {
           // Create payment method from the transaction reference
           pmPayload.source = `ref-${referenceNumber}`;
+          if (expiryMonth) pmPayload.expiry_month = expiryMonth;
+          if (expiryYear) pmPayload.expiry_year = expiryYear;
         } else if (nonceSource) {
           // Create payment method from the nonce
           pmPayload.source = nonceSource;
@@ -479,15 +473,29 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
         if (name) pmPayload.name = name;
 
-        const pmResponse = await Axios.post(
-          `${baseUrl}/customers/${customerId}/payment-methods`,
-          pmPayload,
-          this.axiosConfig(config)
-        );
+        console.log("[KF createSubscription] Step 4: Creating PM", { customerId, source: pmPayload.source });
+        try {
+          const pmResponse = await Axios.post(
+            `${baseUrl}/customers/${customerId}/payment-methods`,
+            pmPayload,
+            this.axiosConfig(config)
+          );
+          paymentMethodId = pmResponse.data?.id;
+          console.log("[KF createSubscription] Step 4 result: pmId", paymentMethodId);
+        } catch (pmErr: any) {
+          // If the payment method already exists for this customer, reuse it
+          const existingPm = pmErr.response?.data?.error_details?.payment_method;
+          if (existingPm?.id) {
+            console.log("KingdomFunding: Payment method already exists, reusing", { pmId: existingPm.id });
+            paymentMethodId = existingPm.id;
+          } else {
+            console.error("KingdomFunding: Failed to create payment method", pmErr.response?.data || pmErr.message);
+            return { success: false, subscriptionId: "", data: { error: "Failed to save payment method for recurring donation" } };
+          }
+        }
 
-        paymentMethodId = pmResponse.data?.id;
         if (!paymentMethodId) {
-          console.error("KingdomFunding: Failed to create payment method", pmResponse.data);
+          console.error("KingdomFunding: No payment method ID obtained");
           return { success: false, subscriptionId: "", data: { error: "Failed to save payment method for recurring donation" } };
         }
       }
@@ -610,17 +618,23 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
   async cancelSubscription(config: GatewayConfig, subscriptionId: string, _reason?: string): Promise<void> {
     try {
       const baseUrl = this.getBaseUrl(config);
+      console.log("KingdomFunding cancelSubscription: deactivating schedule", { subscriptionId, url: `${baseUrl}/recurring-schedules/${subscriptionId}` });
 
       // Deactivate by setting active: false
-      await Axios.patch(
+      const response = await Axios.patch(
         `${baseUrl}/recurring-schedules/${subscriptionId}`,
         { active: false },
         this.axiosConfig(config)
       );
 
-      console.log("KingdomFunding: Recurring schedule deactivated", { subscriptionId });
+      console.log("KingdomFunding: Recurring schedule deactivated", { subscriptionId, responseData: response.data });
     } catch (error: any) {
-      console.error("KingdomFunding cancelSubscription error:", error.response?.data || error.message);
+      console.error("KingdomFunding cancelSubscription error:", {
+        subscriptionId,
+        status: error.response?.status,
+        data: error.response?.data,
+        message: error.message
+      });
       throw new Error(error.response?.data?.error_message || error.message || "Failed to cancel subscription");
     }
   }
@@ -747,7 +761,7 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
       const baseUrl = this.getBaseUrl(config);
       const response = await Axios.get(
         `${baseUrl}/customers/${customerId}/recurring-schedules`,
-        this.axiosConfig(config)
+        { ...this.axiosConfig(config), timeout: 15000 }
       );
       return response.data || [];
     } catch (error: any) {
@@ -794,6 +808,8 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         payload.source = options.source || paymentMethodId;
         // Only auto-prefix with nonce- if it's not already prefixed
         if (!payload.source.startsWith("nonce-") && !payload.source.startsWith("ref-")) payload.source = `nonce-${payload.source}`;
+        if (options.expiry_month) payload.expiry_month = options.expiry_month;
+        if (options.expiry_year) payload.expiry_year = options.expiry_year;
       } else if (options.routing_number) {
         // Save a check/ACH payment method
         payload.routing_number = options.routing_number;
@@ -826,16 +842,17 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
    * Remove a payment method from KingdomFunding.
    * DELETE /payment-methods/:id
    */
-  async detachPaymentMethod(config: GatewayConfig, paymentMethodId: string): Promise<any> {
+  async detachPaymentMethod(config: GatewayConfig, paymentMethodId: string, customerId?: string): Promise<any> {
     try {
       const baseUrl = this.getBaseUrl(config);
+      console.log("KingdomFunding detachPaymentMethod:", { paymentMethodId, customerId });
       const response = await Axios.delete(
         `${baseUrl}/payment-methods/${paymentMethodId}`,
         this.axiosConfig(config)
       );
       return response.data;
     } catch (error: any) {
-      console.error("KingdomFunding detachPaymentMethod error:", error.response?.data || error.message);
+      console.error("KingdomFunding detachPaymentMethod error:", error.response?.data || error.message, { paymentMethodId, customerId });
       throw new Error(error.response?.data?.error_message || error.message || "Failed to remove payment method");
     }
   }

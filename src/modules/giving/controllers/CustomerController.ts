@@ -76,11 +76,14 @@ export class CustomerController extends GivingCrudController {
             const providerName = gw.provider?.toLowerCase();
 
             if (providerName === "kingdomfunding") {
+              // Skip inactive/canceled schedules
+              if (!sub.active) continue;
+
               // Normalize Accept Blue recurring-schedule to Stripe-like format
               const amountCents = Math.round((sub.amount || 0) * 100);
               allSubscriptions.push({
                 id: String(sub.id),
-                status: sub.active ? "active" : "canceled",
+                status: "active",
                 billing_cycle_anchor: sub.created_at
                   ? Math.floor(new Date(sub.created_at).getTime() / 1000)
                   : Math.floor(Date.now() / 1000),
