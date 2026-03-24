@@ -188,7 +188,10 @@ export class DonateController extends GivingCrudController {
           if (this.shouldProcessDonation(provider, webhookResult.eventType!)) {
             const isPending = this.isPendingPayment(provider, webhookResult.eventType!);
             const isCompleted = this.isCompletedPayment(provider, webhookResult.eventType!);
-            const transactionId = webhookResult.eventData?.id;
+            // KingdomFunding puts the transaction ID at reference_number or transaction.id, not at the top-level id
+            const transactionId = webhookResult.eventData?.id
+              || webhookResult.eventData?.reference_number?.toString()
+              || webhookResult.eventData?.transaction?.id?.toString();
 
             if (isCompleted && transactionId) {
               // Check if a pending donation already exists for this transaction
@@ -259,7 +262,10 @@ export class DonateController extends GivingCrudController {
         if (this.shouldProcessDonation(provider, eventType)) {
           const isPending = this.isPendingPayment(provider, eventType);
           const isCompleted = this.isCompletedPayment(provider, eventType);
-          const transactionId = eventData?.id;
+          // KingdomFunding puts the transaction ID at reference_number or transaction.id, not at the top-level id
+          const transactionId = eventData?.id
+            || eventData?.reference_number?.toString()
+            || eventData?.transaction?.id?.toString();
 
           if (isCompleted && transactionId) {
             const existingDonation = await this.repos.donation.loadByTransactionId(churchId, transactionId);

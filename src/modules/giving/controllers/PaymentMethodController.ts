@@ -180,8 +180,12 @@ export class PaymentMethodController extends GivingCrudController {
               });
             }
           } else if (gateway.provider?.toLowerCase() === "kingdomfunding" && Array.isArray(rawPaymentMethods)) {
+            // Only show KF payment methods that have a local record (user hasn't "deleted" them)
+            const localRecords = await this.repos.gatewayPaymentMethod.loadByCustomer(au.churchId, gateway.id, customer.id!);
+            const localExternalIds = new Set(localRecords.map((r: any) => String(r.externalId)));
             for (const pm of rawPaymentMethods) {
               const pmId = String(pm.id);
+              if (!localExternalIds.has(pmId)) continue; // Skip payment methods removed by user
               const cardType = pm.card_type || pm.type || "Card";
               const last4 = pm.last_4 || pm.last4 || "";
               normalizedMethods.push({
@@ -646,7 +650,7 @@ export class PaymentMethodController extends GivingCrudController {
               await GatewayService.detachPaymentMethod(gateway, id);
               remoteDeleteOk = true;
             } catch (retryErr: any) {
-              // Could not delete from Accept Blue (sandbox flaky, etc.) — proceed to clean up locally
+              // Could not delete from Accept Blue — proceed to clean up locally only
               console.warn("[PM Delete] Could not delete PM from provider, cleaning up local records only:", retryErr?.message || retryErr);
             }
           } else {

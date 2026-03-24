@@ -395,7 +395,9 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
       const name = subscriptionData.name || subscriptionData.person?.name?.display || subscriptionData.person?.name || "Donor";
       const email = subscriptionData.email || subscriptionData.person?.email || "";
       const token = subscriptionData.token || subscriptionData.id;
-      const nonceSource = token ? (token.startsWith("nonce-") ? token : `nonce-${token}`) : "";
+      // Only treat as nonce if it's not a numeric saved-PM ID
+      const isSavedPmId = token && /^\d+$/.test(String(token));
+      const nonceSource = (!isSavedPmId && token) ? (String(token).startsWith("nonce-") ? String(token) : `nonce-${token}`) : "";
 
       // Normalize expiry year to 4-digit (accept.blue requires 2020-9999)
       let expiryYear = subscriptionData.expiry_year ? Number(subscriptionData.expiry_year) : undefined;
@@ -455,6 +457,13 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
       // Step 4: Create payment method on the customer
       let paymentMethodId = subscriptionData.paymentMethodId;
+
+      // If the incoming id is a numeric Accept Blue PM ID (saved card), use it directly
+      const rawId = subscriptionData.id ? String(subscriptionData.id) : "";
+      if (!paymentMethodId && rawId && /^\d+$/.test(rawId) && !rawId.startsWith("nonce-")) {
+        console.log("[KF createSubscription] Step 4: Using existing saved PM id", rawId);
+        paymentMethodId = Number(rawId);
+      }
 
       if (!paymentMethodId) {
         const pmPayload: any = {};
