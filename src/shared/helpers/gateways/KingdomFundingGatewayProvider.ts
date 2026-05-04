@@ -419,18 +419,32 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
       let customerId = subscriptionData.customerId;
       let referenceNumber: number | null = null;
-      console.log("[KF createSubscription] startsToday:", startsToday, "customerId:", customerId, "nonceSource:", nonceSource ? nonceSource.substring(0, 20) + "..." : "none", "token:", token ? token.substring(0, 20) + "..." : "none");
+
+      // Detect ACH/bank flow
+      const isBank = subscriptionData.type === "bank"
+        || (subscriptionData.routing_number && subscriptionData.account_number);
+
+      console.log("[KF createSubscription] startsToday:", startsToday, "isBank:", isBank, "customerId:", customerId, "nonceSource:", nonceSource ? nonceSource.substring(0, 20) + "..." : "none", "token:", token ? token.substring(0, 20) + "..." : "none");
 
       // Step 2: If starts today, charge immediately first
-      if (startsToday && nonceSource) {
-        console.log("[KF createSubscription] Step 2: Charging immediately", { amount: subscriptionData.amount, source: nonceSource.substring(0, 20) });
+      if (startsToday && (nonceSource || isBank)) {
         const chargePayload: any = {
           amount: subscriptionData.amount,
-          source: nonceSource,
           name,
         };
-        if (expiryMonth) chargePayload.expiry_month = expiryMonth;
-        if (expiryYear) chargePayload.expiry_year = expiryYear;
+
+        if (isBank) {
+          chargePayload.routing_number = subscriptionData.routing_number;
+          chargePayload.account_number = subscriptionData.account_number;
+          chargePayload.account_type = subscriptionData.account_type || "checking";
+          chargePayload.sec_code = subscriptionData.sec_code || "WEB";
+          console.log("[KF createSubscription] Step 2 (ACH): Charging immediately", { amount: subscriptionData.amount, routing: chargePayload.routing_number });
+        } else {
+          chargePayload.source = nonceSource;
+          if (expiryMonth) chargePayload.expiry_month = expiryMonth;
+          if (expiryYear) chargePayload.expiry_year = expiryYear;
+          console.log("[KF createSubscription] Step 2 (Card): Charging immediately", { amount: subscriptionData.amount, source: nonceSource.substring(0, 20) });
+        }
 
         console.log("[KF createSubscription] Step 2: POST", `${baseUrl}/transactions/charge`);
         const chargeResponse = await Axios.post(
@@ -469,10 +483,15 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         const pmPayload: any = {};
 
         if (referenceNumber) {
-          // Create payment method from the transaction reference
+          // Create payment method from the transaction reference (works for both card and ACH)
           pmPayload.source = `ref-${referenceNumber}`;
-          if (expiryMonth) pmPayload.expiry_month = expiryMonth;
-          if (expiryYear) pmPayload.expiry_year = expiryYear;
+          if (!isBank && expiryMonth) pmPayload.expiry_month = expiryMonth;
+          if (!isBank && expiryYear) pmPayload.expiry_year = expiryYear;
+        } else if (isBank) {
+          // ACH future-dated subscription — create PM directly from routing/account
+          pmPayload.routing_number = subscriptionData.routing_number;
+          pmPayload.account_number = subscriptionData.account_number;
+          pmPayload.account_type = subscriptionData.account_type || "checking";
         } else if (nonceSource) {
           // Create payment method from the nonce
           pmPayload.source = nonceSource;
@@ -812,9 +831,10 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
       const payload: any = {};
 
-      if (options.source || paymentMethodId.startsWith("nonce-") || paymentMethodId.startsWith("ref-")) {
+      const pmIdStr = paymentMethodId ? String(paymentMethodId) : "";
+      if (options.source || pmIdStr.startsWith("nonce-") || pmIdStr.startsWith("ref-")) {
         // Save from a nonce token or transaction reference
-        payload.source = options.source || paymentMethodId;
+        payload.source = options.source || pmIdStr;
         // Only auto-prefix with nonce- if it's not already prefixed
         if (!payload.source.startsWith("nonce-") && !payload.source.startsWith("ref-")) payload.source = `nonce-${payload.source}`;
         if (options.expiry_month) payload.expiry_month = options.expiry_month;
@@ -825,6 +845,7 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         payload.account_number = options.account_number;
         payload.account_type = options.account_type || "checking";
         payload.name = options.name || "";
+        payload.sec_code = options.sec_code || "WEB";
       } else {
         // Save card data
         payload.card = options.card;
@@ -834,6 +855,7 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         if (options.avs_zip) payload.avs_zip = options.avs_zip;
       }
 
+      console.log("[KF attachPaymentMethod] POST", `${baseUrl}/customers/${customerId}/payment-methods`, "payload:", JSON.stringify({ ...payload, account_number: payload.account_number ? `****${String(payload.account_number).slice(-4)}` : undefined }));
       const response = await Axios.post(
         `${baseUrl}/customers/${customerId}/payment-methods`,
         payload,
@@ -842,7 +864,7 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
       return response.data;
     } catch (error: any) {
-      console.error("KingdomFunding attachPaymentMethod error:", error.response?.data || error.message);
+      console.error("KingdomFunding attachPaymentMethod error:", JSON.stringify(error.response?.data) || error.message);
       throw new Error(error.response?.data?.error_message || error.message || "Failed to save payment method");
     }
   }
@@ -929,12 +951,21 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
       const refNumber = String(eventData.reference_number || eventData.transaction?.id || eventData.id || "");
 
+      // Use the actual transaction timestamp instead of "now" — webhooks may arrive much later
+      // (ACH webhooks can be days delayed). Falls back to now if no timestamp is provided.
+      let donationDate: Date = new Date();
+      const txTimestamp = eventData.transaction?.created_at || eventData.created_at || eventData.timestamp;
+      if (txTimestamp) {
+        const parsed = new Date(txTimestamp);
+        if (!isNaN(parsed.getTime())) donationDate = parsed;
+      }
+
       const donation: Donation = {
         churchId,
         batchId: batch.id,
         personId,
         transactionId: refNumber,
-        donationDate: new Date(),
+        donationDate,
         amount,
         method,
         methodDetails,

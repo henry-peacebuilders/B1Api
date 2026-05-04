@@ -250,11 +250,19 @@ export class PaymentMethodController extends GivingCrudController {
         const buildAttachOptions = (custId: string) => {
           const opts: any = { customer: custId, customerId: custId };
           if (gateway.provider?.toLowerCase() === "kingdomfunding") {
-            opts.source = id;
-            if (req.body.expiry_month) opts.expiry_month = req.body.expiry_month;
-            if (req.body.expiry_year) opts.expiry_year = req.body.expiry_year;
-            if (req.body.cardBrand) opts.cardBrand = req.body.cardBrand;
-            if (req.body.cardLast4) opts.cardLast4 = req.body.cardLast4;
+            // Detect ACH vs card based on which fields the frontend sent
+            if (req.body.routing_number && req.body.account_number) {
+              opts.routing_number = req.body.routing_number;
+              opts.account_number = req.body.account_number;
+              opts.account_type = req.body.account_type || "checking";
+              opts.name = req.body.name;
+            } else {
+              opts.source = id;
+              if (req.body.expiry_month) opts.expiry_month = req.body.expiry_month;
+              if (req.body.expiry_year) opts.expiry_year = req.body.expiry_year;
+              if (req.body.cardBrand) opts.cardBrand = req.body.cardBrand;
+              if (req.body.cardLast4) opts.cardLast4 = req.body.cardLast4;
+            }
           }
           return opts;
         };
@@ -296,14 +304,33 @@ export class PaymentMethodController extends GivingCrudController {
                 ? `${(card.brand || "Card").toUpperCase()} •••• ${card.last4 ?? ""}`.trim()
                 : paypalSource?.email_address || `PayPal token ${tokenId.substring(0, 6)}...`;
             } else {
-              // KingdomFunding
-              const cardType = pm?.card_type || req.body.cardBrand || "Card";
-              const last4 = pm?.last_4 || req.body.cardLast4 || "";
-              methodType = pm?.type === "check" ? "bank" : "card";
-              displayName = `${cardType} •••• ${last4}`.trim();
+              // KingdomFunding — detect card vs bank/check
+              const isBank = pm?.type === "check"
+                || pm?.account_type
+                || !!pm?.routing_number
+                || !!req.body.routing_number;
+
+              if (isBank) {
+                methodType = "bank";
+                const acctType = pm?.account_type || req.body.account_type || "checking";
+                const last4 = pm?.last4
+                  || (pm?.account_number ? String(pm.account_number).slice(-4) : "")
+                  || (req.body.account_number ? String(req.body.account_number).slice(-4) : "");
+                const acctLabel = acctType.charAt(0).toUpperCase() + acctType.slice(1);
+                displayName = `Bank ${acctLabel} •••• ${last4}`.trim();
+              } else {
+                methodType = "card";
+                const cardType = pm?.card_type || req.body.cardBrand || "Card";
+                const last4 = pm?.last_4 || req.body.cardLast4 || "";
+                displayName = `${cardType} •••• ${last4}`.trim();
+              }
             }
 
             const existing = await this.repos.gatewayPaymentMethod.loadByExternalId(cId, gateway.id, tokenId);
+            const isBankRecord = methodType === "bank";
+            const recordLast4 = isBankRecord
+              ? (pm?.last4 || (pm?.account_number ? String(pm.account_number).slice(-4) : "") || (req.body.account_number ? String(req.body.account_number).slice(-4) : ""))
+              : (pm?.last_4 || req.body.cardLast4 || "");
             const record: GatewayPaymentMethod = {
               id: existing?.id,
               churchId: cId,
@@ -314,8 +341,10 @@ export class PaymentMethodController extends GivingCrudController {
               displayName,
               metadata: {
                 status: pm?.status,
-                brand: pm?.card_type || req.body.cardBrand,
-                last4: pm?.last_4 || req.body.cardLast4
+                brand: isBankRecord
+                  ? (pm?.account_type || req.body.account_type || "Bank")
+                  : (pm?.card_type || req.body.cardBrand),
+                last4: recordLast4
               }
             };
             await this.repos.gatewayPaymentMethod.save(record);

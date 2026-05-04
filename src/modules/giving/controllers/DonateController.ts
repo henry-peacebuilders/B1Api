@@ -676,7 +676,7 @@ export class DonateController extends GivingCrudController {
   @httpPost("/subscribe")
   public async subscribe(req: express.Request<any>, res: express.Response): Promise<any> {
     return this.actionWrapper(req, res, async (au) => {
-      const { id, amount, customerId, type, billing_cycle_anchor, proration_behavior, interval, funds, person, notes, churchId: CHURCH_ID, provider, gatewayId, currency, expiry_month, expiry_year } = req.body;
+      const { id, amount, customerId, type, billing_cycle_anchor, proration_behavior, interval, funds, person, notes, churchId: CHURCH_ID, provider, gatewayId, currency, expiry_month, expiry_year, routing_number, account_number, account_type, sec_code, name: bankName } = req.body;
       const churchId = au.churchId || CHURCH_ID;
 
       // Validate required parameters
@@ -708,10 +708,15 @@ export class DonateController extends GivingCrudController {
           interval,
           notes,
           person,
-          name: person?.name?.display || person?.name || "",
+          name: bankName || person?.name?.display || person?.name || "",
           email: person?.email || "",
           expiry_month,
           expiry_year,
+          // ACH/bank fields for KingdomFunding recurring donations
+          routing_number,
+          account_number,
+          account_type,
+          sec_code,
         };
 
         // For KF: pass existing local customer ID so provider can reuse it

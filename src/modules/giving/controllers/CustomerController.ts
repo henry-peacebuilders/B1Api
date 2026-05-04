@@ -80,12 +80,15 @@ export class CustomerController extends GivingCrudController {
               if (!sub.active) continue;
 
               // Normalize Accept Blue recurring-schedule to Stripe-like format
+              // Use next_run_date so the UI's "Start Date" column shows when the
+              // next charge will occur (more useful than schedule-creation timestamp).
               const amountCents = Math.round((sub.amount || 0) * 100);
+              const anchorSrc = sub.next_run_date || sub.created_at;
               allSubscriptions.push({
                 id: String(sub.id),
                 status: "active",
-                billing_cycle_anchor: sub.created_at
-                  ? Math.floor(new Date(sub.created_at).getTime() / 1000)
+                billing_cycle_anchor: anchorSrc
+                  ? Math.floor(new Date(anchorSrc).getTime() / 1000)
                   : Math.floor(Date.now() / 1000),
                 default_payment_method: sub.payment_method_id ? String(sub.payment_method_id) : undefined,
                 plan: {
