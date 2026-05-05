@@ -217,7 +217,6 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         payload.customer_id = isNaN(cid) ? donationData.customerId : cid;
       }
 
-      console.log("KF charge payload:", JSON.stringify({ url: `${baseUrl}/transactions/charge`, source: payload.source, amount: payload.amount, customer_id: payload.customer_id }));
       const response = await Axios.post(
         `${baseUrl}/transactions/charge`,
         payload,
@@ -424,8 +423,6 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
       const isBank = subscriptionData.type === "bank"
         || (subscriptionData.routing_number && subscriptionData.account_number);
 
-      console.log("[KF createSubscription] startsToday:", startsToday, "isBank:", isBank, "customerId:", customerId, "nonceSource:", nonceSource ? nonceSource.substring(0, 20) + "..." : "none", "token:", token ? token.substring(0, 20) + "..." : "none");
-
       // Step 2: If starts today, charge immediately first
       if (startsToday && (nonceSource || isBank)) {
         const chargePayload: any = {
@@ -438,15 +435,12 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
           chargePayload.account_number = subscriptionData.account_number;
           chargePayload.account_type = subscriptionData.account_type || "checking";
           chargePayload.sec_code = subscriptionData.sec_code || "WEB";
-          console.log("[KF createSubscription] Step 2 (ACH): Charging immediately", { amount: subscriptionData.amount, routing: chargePayload.routing_number });
         } else {
           chargePayload.source = nonceSource;
           if (expiryMonth) chargePayload.expiry_month = expiryMonth;
           if (expiryYear) chargePayload.expiry_year = expiryYear;
-          console.log("[KF createSubscription] Step 2 (Card): Charging immediately", { amount: subscriptionData.amount, source: nonceSource.substring(0, 20) });
         }
 
-        console.log("[KF createSubscription] Step 2: POST", `${baseUrl}/transactions/charge`);
         const chargeResponse = await Axios.post(
           `${baseUrl}/transactions/charge`,
           chargePayload,
@@ -454,7 +448,6 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         );
 
         referenceNumber = chargeResponse.data?.reference_number;
-        console.log("[KF createSubscription] Step 2 result: ref#", referenceNumber);
         if (!referenceNumber) {
           const errMsg = chargeResponse.data?.error_message || "Initial charge failed";
           console.error("KingdomFunding: Initial recurring charge failed", chargeResponse.data);
@@ -464,9 +457,7 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
       // Step 3: Create customer
       if (!customerId) {
-        console.log("[KF createSubscription] Step 3: Creating customer", { email, name });
         customerId = await this.createCustomer(config, email, name);
-        console.log("[KF createSubscription] Step 3 result: customerId", customerId);
       }
 
       // Step 4: Create payment method on the customer
@@ -475,7 +466,6 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
       // If the incoming id is a numeric Accept Blue PM ID (saved card), use it directly
       const rawId = subscriptionData.id ? String(subscriptionData.id) : "";
       if (!paymentMethodId && rawId && /^\d+$/.test(rawId) && !rawId.startsWith("nonce-")) {
-        console.log("[KF createSubscription] Step 4: Using existing saved PM id", rawId);
         paymentMethodId = Number(rawId);
       }
 
@@ -501,7 +491,6 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
 
         if (name) pmPayload.name = name;
 
-        console.log("[KF createSubscription] Step 4: Creating PM", { customerId, source: pmPayload.source });
         try {
           const pmResponse = await Axios.post(
             `${baseUrl}/customers/${customerId}/payment-methods`,
@@ -509,7 +498,6 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
             this.axiosConfig(config)
           );
           paymentMethodId = pmResponse.data?.id;
-          console.log("[KF createSubscription] Step 4 result: pmId", paymentMethodId);
         } catch (pmErr: any) {
           // If the payment method already exists for this customer, reuse it
           const existingPm = pmErr.response?.data?.error_details?.payment_method;
@@ -855,7 +843,6 @@ export class KingdomFundingGatewayProvider extends AbstractExperimentalGatewayPr
         if (options.avs_zip) payload.avs_zip = options.avs_zip;
       }
 
-      console.log("[KF attachPaymentMethod] POST", `${baseUrl}/customers/${customerId}/payment-methods`, "payload:", JSON.stringify({ ...payload, account_number: payload.account_number ? `****${String(payload.account_number).slice(-4)}` : undefined }));
       const response = await Axios.post(
         `${baseUrl}/customers/${customerId}/payment-methods`,
         payload,

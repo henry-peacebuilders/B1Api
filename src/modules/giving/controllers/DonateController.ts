@@ -193,22 +193,40 @@ export class DonateController extends GivingCrudController {
               || webhookResult.eventData?.reference_number?.toString()
               || webhookResult.eventData?.transaction?.id?.toString();
 
+            // Idempotency: always check for an existing donation by transactionId before creating.
+            // This protects against:
+            //   - Same webhook delivered twice (Cloud Tasks retries with same body.id are caught
+            //     by eventLog dedup above; retries with new delivery IDs are caught here)
+            //   - Multiple status webhooks for the same transaction (e.g., ACH succeeded then settled)
+            //   - The /donate/charge endpoint already logging the donation immediately, then the
+            //     async webhook arriving later
+            const existingDonation = transactionId
+              ? await this.repos.donation.loadByTransactionId(churchId, transactionId)
+              : null;
+
             if (isCompleted && transactionId) {
-              // Check if a pending donation already exists for this transaction
-              const existingDonation = await this.repos.donation.loadByTransactionId(churchId, transactionId);
               if (existingDonation) {
-                // Update existing pending donation to complete
+                // Update existing pending/in-flight donation to complete
                 await GatewayService.updateDonationStatus(gateway, churchId, transactionId, "complete", this.repos);
               } else {
-                // No pending donation found, create a new complete donation
+                // No prior donation found, create a new complete donation
                 await GatewayService.logDonation(gateway, churchId, webhookResult.eventData, this.repos, "complete");
               }
             } else if (isPending) {
-              // Create a new pending donation for ACH payments
-              await GatewayService.logDonation(gateway, churchId, webhookResult.eventData, this.repos, "pending");
+              if (existingDonation) {
+                // Pending webhook for a transaction we already know about — no-op
+                console.log(`KingdomFunding webhook: skipping duplicate pending event for txnId=${transactionId}`);
+              } else {
+                // Create a new pending donation for ACH payments awaiting settlement
+                await GatewayService.logDonation(gateway, churchId, webhookResult.eventData, this.repos, "pending");
+              }
             } else {
               // Regular completed donation (card payments, etc.)
-              await GatewayService.logDonation(gateway, churchId, webhookResult.eventData, this.repos, "complete");
+              if (existingDonation && transactionId) {
+                await GatewayService.updateDonationStatus(gateway, churchId, transactionId, "complete", this.repos);
+              } else {
+                await GatewayService.logDonation(gateway, churchId, webhookResult.eventData, this.repos, "complete");
+              }
             }
           } else if (this.shouldCancelSubscription(provider, webhookResult.eventType!)) {
             await this.repos.subscription.delete(churchId, webhookResult.eventData.id);

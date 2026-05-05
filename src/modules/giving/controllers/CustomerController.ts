@@ -42,6 +42,12 @@ export class CustomerController extends GivingCrudController {
       const allGateways = (await this.repos.gateway.loadAll(au.churchId)) as any[];
       const allSubscriptions: any[] = [];
 
+      // If no gateways are configured, return empty array (church hasn't set up giving)
+      if (!allGateways || allGateways.length === 0) {
+        console.warn(`getSubscriptions: no gateways configured for churchId=${au.churchId}`);
+        return [];
+      }
+
       for (const gw of allGateways) {
         const capabilities = GatewayService.getProviderCapabilities(gw);
         if (!capabilities?.supportsSubscriptions) continue;
